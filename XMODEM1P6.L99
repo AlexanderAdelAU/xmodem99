@@ -1,0 +1,701 @@
+                        
+                        ;
+                        ;****************************************
+                        ;
+                        ;	NAME XMODEM
+                        ;	PURPOSE : TO TRANSFER FILES BETWEEN MACHINES
+                        ;	USING THE XMODEM PROTOCOL.  WRITTEN BY ALEXANDER CAMERON
+                        ;	VERSION 1.3	14TH MAY 2020 - DURING THE COVID-19 PANDEMIC IN ADELAIDE
+                        ;	VERSION 1.4	24TH MAY 2020 - ADDED SECTOR BY SECTOR DIRECT WRITING TO DISC
+                        ;	VERSION 1.6	23RD OCT 2024 - FIXED ERROR DETECTION AND MESSAGING
+                        ;	USAGE:  XMODEM <FILENAME> {NO OPTION LIST AT PRESENT}
+                        ;
+                        ;
+                        ; -------- 3. MESSAGE BLOCK LEVEL PROTOCOL
+                        
+                        ;Link to this description;  http://textfiles.com/programming/ymodem.txt
+                        ;
+                        ; Each block of the transfer looks like:
+                        ; <SOH><blk #><255-blk #><--128 data bytes--><cksum>
+                        ;    in which:
+                        ;
+                        ; <SOH>       = 01 hex
+                        ; <blk #>     = binary number, starts at 01 increments by 1, and
+                        ;               wraps 0FFH to 00H (not to 01)
+                        ; <255-blk #> = blk # after going thru 8080 "CMA" instr.
+                        ;               Formally, this is the "ones complement".
+                        ; <cksum>     = the sum of the data bytes only.  Toss any carry.
+                        ;
+                        ;
+                        ;  SENDER                           RECEIVER
+                        ;                                   Times out after 20 seconds,
+                        ;                           <---    <nak>
+                        ;  <soh> 01 FE -data- <xx>   --->
+                        ;                           <---    <ack>
+                        ;  <soh> 02 FD -data- <xx>   --->   (data gets line hit)
+                        ;                           <---    <nak>
+                        ;  <soh> 02 FD -data- <xx>   --->
+                        ;                           <---    <ack>
+                        ;  <soh> 03 FC -data- <xx>   --->   (ack gets garbaged)    <---    <ack>
+                        ;  <soh> 03 FC -data- <xx>   --->
+                        ;                           <---    <ack>
+                        ;  <eot>                     --->
+                        ;                           <---    <ack>
+                        ;
+                        ;
+                        ;**************************************
+                        ;
+                        ; THESE XOP ARE DEFINED IN THE MONITOR.   
+                        ; NOTE XOP WORSPACES ARE OVERLAPPED 
+                        ; SO THAT ALL REGISTERS R0 TO R7 ARE SHARED.
+                        ;
+                        ;
+                        	DXOP	CALL,6
+                        	DXOP	RET,7
+                        	DXOP	PUSH,8
+                        	DXOP	POP,9
+                        	DXOP	WHEX,10		;WRITE OUT A 16 BIT HEX VALUE
+                        	DXOP	RHEX,11		;READ IN A 16 BIT HEX VALUE
+                        	DXOP	WRITE,12		;WRITE CHAR IN MSB
+                        	DXOP	READ,13		;READ CHAR IN MSB
+                        	DXOP	MESG,14		;OUTPUT NULL TERMINATED MESSAGE
+                        ;
+  0000                  R0	EQU	0
+  0001                  R1	EQU	1
+  0002                  R2	EQU	2
+  0003                  R3	EQU	3
+  0004                  R4	EQU	4
+  0005                  R5	EQU	5
+  0006                  R6	EQU	6
+  0007                  R7	EQU	7
+  0008                  R8	EQU	8
+  0009                  SL	EQU	9
+  000A                  SP	EQU	10
+  000B                  R11	EQU	11
+  000C                  R12	EQU	12
+  000D                  R13	EQU	13
+  000E                  R14	EQU	14
+  000F                  R15	EQU	15
+                        ;
+                        ;
+                        ;	BDOS EQUATES	
+                        ;
+  0500                  TPA	EQU	0500H		;DEFAULT START ADDRESS
+  0084                  BDOS	EQU	84H		;BDOS VECTORS.
+  0080                  SHELL	EQU	80H		;SHELL VECTOR
+  00A0                  CMDLINE	EQU	0A0H		;SHELL COMMAND LINE POINTER
+                        
+  000B                  NAMSIZ	EQU	11		;DIRECTORY NAME SIZE
+  000E                  SELDSK	EQU	14
+  000F                  OPEN	EQU	15
+  0010                  FCLOSE	EQU	16
+  0013                  ERAFIL	EQU	19
+  0016                  MAKFIL	EQU	22
+  0015                  WRSEQ	EQU	21
+  001A                  SETDMA	EQU	26
+                        ;
+                        ;---FCB	EQUATES
+                        ;
+  0000                  NAM	EQU	0
+  000B                  FTY	EQU	11
+  0010                  FLA	EQU	16
+  000C                  FSB	EQU	12
+  000E                  FSZ	EQU	14
+  001A                  CRN	EQU	26
+                        ;
+                        ;
+  0500                  	AORG	TPA
+  0500   1004           	JMP	START
+                        ;
+                        ;	MISC DEFINITIONS
+                        ;
+  0502   20             SPACE	BYTE	20H
+  0503   2D             SWITCH	BYTE	'-'		;COMMAND LINE SWITCH
+  0200                  BYTSEC	EQU	512
+  0080                  RECSIZE 	EQU	128
+  0504   0004           REC_COUNT	WORD	4		;THIS ASSUME 4 128 BYTE RECORDS PER BLOCK
+                        ;
+                        ;
+  0506   0460 05AE      CMD_ERROR:	B	@CMDERR
+                        
+  050A   2FA0 06CE      START:	MESG	@VERSION
+  050E   2FA0 0600      	MESG	@CRLF
+  0512   C120 00A0      	MOV	@CMDLINE,R4		;GET CMD BUFFER POINTER
+                        START01
+  0516   9834 0502      	CB	*R4+,@SPACE	 	;JUMP OVER PROGRAMME COMMAND AND LOOK FOR SPACES BETWEEN COMMAND ARGS
+  051A   1AF5           	JL	CMD_ERROR
+  051C   16FC           	JNE	START01
+  051E   0604           	DEC	R4	 	;BACK UP TO 1ST CHAR
+  0520   9814 0600      	CB	*R4,@CRLF;
+  0524   13F0           	JEQ	CMD_ERROR
+                        ;	DEC	R4	 	;BACK UP TO 1ST CHAR
+                        ;
+  0526   9834 0502      START02	CB	*R4+,@SPACE		;NOW JUMP OVER SPACES
+  052A   13FD           	JEQ	START02
+  052C   0604           	DEC	R4
+  052E   9814 0600      	CB	*R4,@CRLF;
+  0532   13E9           	JEQ	CMD_ERROR
+  0534   C804 0952      	MOV	R4,@LINPTR
+  0538   C0C4           	MOV	R4,R3		;R3->NAME
+  053A   0200 000B      	LI	R0,NAMSIZ 		;FCB COUNTER
+  053E   0208 092E      	LI	R8,FCB	  	;
+  0542   C088           	MOV	R8,R2	 	;SAVE FCB
+  0544   9813 0502      NAM0	CB	*R3,@SPACE	 	;END OF NAME ?
+  0548   1204           	JLE	NAM4	 	;YES
+  054A   DCB3           	MOVB	*R3+,*R2+		;STORE IN FCB
+  054C   0600           	DEC	R0
+  054E   16FA           	JNE	NAM0
+  0550   1004           	JMP	GOT_NAME
+  0552   DCA0 0502      NAM4	MOVB	@SPACE,*R2+	 	;PAD WITH SPACES
+  0556   0600           	DEC	R0
+  0558   16FC           	JNE	NAM4
+                        ;
+                        ; CREATE THE NAMED FILE
+                        ;
+  055A   0202 000E      GOT_NAME:	LI	R2,SELDSK
+  055E   04C3           	CLR	R3
+  0560   2DA0 0084      	CALL	@BDOS		;SELECT DRIVE A
+  0564   0202 0013      	LI	R2,ERAFIL 		;PURGE IF ALREADY EXITS
+  0568   0203 092E      	LI	R3,FCB
+  056C   2DA0 0084      	CALL	@BDOS
+  0570   0202 0016      	LI	R2,MAKFIL
+  0574   0203 092E      	LI	R3,FCB
+  0578   2DA0 0084      	CALL	@BDOS	 	;TRY TO MAKE THE FILE
+  057C   C041           	MOV	R1,R1	 	;SUCCESS ?
+  057E   1113           	JLT	MKERR	 	;MAKE ERROR
+  0580   04C0           	CLR	R0
+  0582   0203 092E      	LI	R3,FCB
+  0586   D8C0 000B      	MOVB	R0,@FTY(R3)		;ZERO SAYS DONT CARE
+  058A   C8C0 001A      	MOV	R0,@CRN(R3)		;BEGIN AT FIRST RECORD
+  058E   0200 0500      	LI	R0,TPA		;ASSUME TPA
+  0592   C8C0 0010      	MOV	R0,@FLA(R3)		;INTO LOAD ADDRESS
+                        ;
+                        ;	BEGIN RECEIVING THE FILE BY LOADING INTO THE BUFFER
+                        ;	WRITE SECTOR BY SECTOR TO DISC
+                        ;
+  0596   2DA0 074E      	CALL	@RECV_FILE		;RECEIVE THE FILE AND WRITE IT SECTOR BY SECTOR
+  059A   2DA0 05BE      	CALL	@CLOSE_FILE
+  059E   2FA0 06FC      	MESG	@SUCCESS
+  05A2   0460 05D6      	B	@EXIT
+                        ;
+                        ;=======================================================
+                        ;
+                        ;	ERROR CREATING FILE, SHOW MESSAGE THEN EXIT
+                        ;
+                        ;=======================================================
+  05A6   0200 0626      MKERR:	LI	R0,MAKMSG
+  05AA   0460 0862      	B	@LOAD_END
+                        
+                        ;
+                        ;  TERMINATE THE PROCESS
+                        ;
+  05AE   0200 0604      CMDERR:	LI	R0,CMDMSG
+  05B2   C800 0740      	MOV	R0,@ERR_MSG_ADDR
+  05B6   2DA0 089E      	CALL	@PRINTMSG
+  05BA   0460 05D6      	B	@EXIT
+                        ;
+                        ;=======================================================
+                        ;
+                        ;	CLOSE THE FILE, IF SECTOR BUFFER HAS RECEIVED DATA
+                        ;	THEN FLUSH WITH A CALL TO wRITE_SECTOR
+                        ;
+                        ;=======================================================
+                        CLOSE_FILE:
+  05BE   C020 0504      	MOV	@REC_COUNT,R0
+  05C2   1302           	JEQ	CLS_1
+  05C4   2DA0 05DC      	CALL	@WRITE_SECTOR	;FLUSH AND WRITE ALL
+                        
+  05C8   0202 0010      CLS_1:	LI	R2,FCLOSE	 	;NOW CLOSE THE FILE
+  05CC   0203 092E      	LI	R3,FCB
+  05D0   2DA0 0084      	CALL	@BDOS
+  05D4   2DC0           	RET
+                        ;
+  05D6   04C1           EXIT:	CLR	R1		;RETURN CODE FOR SHELL
+  05D8   0460 0080      	B	@SHELL		;NEED TO CALL SHELL INIT BECAUSE WE HAVE ALTERED WP
+                        ;
+                        ;****************************************************************************
+                        ;
+                        ; WRITE 2 SECTOR'S WORTH OF DATA I.E. BASED ON 512 BYTE SECTORS ON THE DISC
+                        ;
+                        ;*****************************************************************************
+                        ;
+                        WRITE_SECTOR:
+                        ;	LI	R2,SELDSK
+                        ;	CLR	R3
+                        ;	CALL	@BDOS
+  05DC   0203 0956      	LI	R3,SECTOR_BUFFER
+  05E0   0202 001A      	LI	R2,SETDMA
+  05E4   2DA0 0084      	CALL	@BDOS
+  05E8   0202 0015      	LI	R2,WRSEQ
+  05EC   0203 092E      	LI	R3,FCB
+  05F0   2DA0 0084      	CALL	@BDOS
+  05F4   04C1           	CLR	R1
+  05F6   C041           	MOV	R1,R1	 		;WRITE ERROR ?
+  05F8   1101           	JLT	WS_E	 		;YES
+  05FA   2DC0           	RET
+  05FC   0460 085C      WS_E:	B	@WRITE_ERROR
+                        ;	
+                        ;
+                        ; ERROR MESSAGE AND HANDLING
+                        ;
+  0600   0D0A 00        CRLF	BYTE	0DH,0AH,0
+  0603   00             	EVEN
+  0604   2A2A 2055      CMDMSG	TEXT	"** USAGE: XMODEM <FILENAME> **"
+  0608   5341 4745      
+  060C   3A20 584D      
+  0610   4F44 454D      
+  0614   203C 4649      
+  0618   4C45 4E41      
+  061C   4D45 3E20      
+  0620   2A2A           
+  0622   0D0A 00        	BYTE	0DH,0AH,0
+  0625   00             	EVEN
+                        
+  0626   2A2A 2046      MAKMSG	TEXT	"** FILE CREATE ERROR **"
+  062A   494C 4520      
+  062E   4352 4541      
+  0632   5445 2045      
+  0636   5252 4F52      
+  063A   202A 2A        
+  063D   0D0A 00        	BYTE	0DH,0AH,0
+  0640                  	EVEN
+                        WRITE_MESSAGE
+  0640   2A2A 204F      	TEXT	"** OUTPUT FILE WRITE ERROR **"
+  0644   5554 5055      
+  0648   5420 4649      
+  064C   4C45 2057      
+  0650   5249 5445      
+  0654   2045 5252      
+  0658   4F52 202A      
+  065C   2A             
+  065D   0D0A 00        	BYTE	0DH,0AH,0
+  0660                  	EVEN
+  0660   0D0A           MDMMSG  	BYTE	0DH,0AH
+  0662   2A2A 2046      	TEXT	"** FATAL LOAD ERROR **"
+  0666   4154 414C      
+  066A   204C 4F41      
+  066E   4420 4552      
+  0672   524F 5220      
+  0676   2A2A           
+  0678   00             	BYTE	0
+  0679   00             	EVEN
+                        SECT_ERROR_MSG
+  067A   0D0A           	BYTE	0DH,0AH
+  067C   2A2A 2052      	TEXT	"** RECEIVE SECTOR ERROR **"
+  0680   4543 4549      
+  0684   5645 2053      
+  0688   4543 544F      
+  068C   5220 4552      
+  0690   524F 5220      
+  0694   2A2A           
+  0696   0D0A 00        	BYTE	0DH,0AH,0
+  0699   00             	EVEN
+                        
+                        SEQ_ERROR_MSG
+  069A   0D0A           	BYTE    0DH,0AH
+  069C   2A2A 2053      	TEXT	"** SECTOR OUT OF SEQUENCE ERROR **"
+  06A0   4543 544F      
+  06A4   5220 4F55      
+  06A8   5420 4F46      
+  06AC   2053 4551      
+  06B0   5545 4E43      
+  06B4   4520 4552      
+  06B8   524F 5220      
+  06BC   2A2A           
+  06BE   0D0A 00        	BYTE	0DH,0AH,0
+  06C1   00             	EVEN
+                        END_MESSAGE
+  06C2   4C4F 4144      	TEXT	"LOAD_END"
+  06C6   5F45 4E44      
+  06CA   0D0A 00        	BYTE	0DH,0AH,0
+  06CD   00             	EVEN
+  06CE   4D4F 4445      VERSION	TEXT	"MODEM VERSION 1.6 - READY."
+  06D2   4D20 5645      
+  06D6   5253 494F      
+  06DA   4E20 312E      
+  06DE   3620 2D20      
+  06E2   5245 4144      
+  06E6   592E           
+  06E8   0D0A 00        	BYTE	0DH,0AH,0
+  06EB   00             	EVEN
+  06EC   5341 5649      SAVING	TEXT	"SAVING FILE.."
+  06F0   4E47 2046      
+  06F4   494C 452E      
+  06F8   2E             
+  06F9   0D0A 00        	BYTE	0DH,0AH,0
+  06FC                  	EVEN
+  06FC   5355 4343      SUCCESS	TEXT	"SUCCESS."
+  0700   4553 532E      
+  0704   0D0A 00        	BYTE	0DH,0AH,0
+  0707   00             	EVEN
+                        CLOSE_MESSAGE
+  0708   2A2A 2A45      	TEXT	"***ERROR CLOSING FILE ***"
+  070C   5252 4F52      
+  0710   2043 4C4F      
+  0714   5349 4E47      
+  0718   2046 494C      
+  071C   4520 2A2A      
+  0720   2A             
+  0721   0D0A 00        	BYTE	0DH,0AH,0
+  0724                  	EVEN
+                        LARGE_FILE_MSG
+  0724   2A2A 2A45      	TEXT	"***ERROR CLOSING FILE ***"
+  0728   5252 4F52      
+  072C   2043 4C4F      
+  0730   5349 4E47      
+  0734   2046 494C      
+  0738   4520 2A2A      
+  073C   2A             
+  073D   0D0A 00        	BYTE	0DH,0AH,0
+  0740                  	EVEN
+  0740   0000           ERR_MSG_ADDR:	WORD    0   ;ADDRESS OF MESSAGE TO BE OUTPUT
+                        
+                        
+                        
+                        ;CLOSERR	MESG	@CLOSE_MESSAGE		;IF WE DONT CLOSE UNUSED BLOCKS MAY
+                        ;	JMP	MKERR			;BE STILL ALLOCATED	
+                        ;LARGERR	MESG	@LARGE_FILE_MSG
+                        ;	JMP	MKERR
+                        	
+                        ;
+                        ;	
+                        ;  LOAD THE RECIEVED FILE OR MODULE INTO MEMDORY
+                        ;
+  0742   15             NAK		BYTE	15H
+  0743   06             ACK		BYTE	06H
+  0744   01             SOH		BYTE	01H
+  0745   04             EOT		BYTE	04H
+  0746   17             ETB		BYTE	017H
+  0747   18             CAN		BYTE	018H
+  0748   00             NULL		BYTE	000H
+  0749   00             RECVD_SECT_NO	BYTE	0		;RECEIVED RECORD NUMBER	
+  074A   00             COMP_REC_NO		BYTE	0		;INVERED NUMBER OF RECEIVED RECORD NUMBER
+  074B   00             SECTNO		BYTE	0		;PREVIOUS RECEIVED RECORD NUMBER
+  074C   00             CHECKSUM		BYTE	0
+  074D   FF             REC_TIME_OUT	BYTE	0FFH
+  074E                  		EVEN
+                        ;
+                        RECV_FILE:
+  074E   0204 0956      	LI	R4,SECTOR_BUFFER
+  0752   04C0           	CLR	R0
+  0754   C800 074B      	MOV	R0,@SECTNO		; MUST BEGIN THIS AT ZERO 
+                        ;
+                        ;
+                        ; THIS IS THE MAIN RECEIVE LOOP.  FIRST WE MUST WAIT FOR THE USER TO SELECT THE FILE.   THIS IS
+                        ; A CRUDE WAY OF DOING, BUT IS ABOUT 15 SECONDS
+                        ;
+  0758   0200 0038      	LI	R0,038H
+  075C   0201 FFFF      WAIT1	LI	R1,0FFFFH
+  0760   0601           WAIT2	DEC	R1
+  0762   16FE           	JNE	WAIT2
+  0764   0600           	DEC	R0
+  0766   16FA           	JNE	WAIT1
+                        ;
+                        ; SEND NAK TO TELL SENDER WE ARE READY AND TO KICK THINGS OFF
+                        ;
+  0768   D0A0 0742      	MOVB	@NAK,R2
+  076C   2DA0 08FE      	CALL	@TX
+                        
+  0770   0200 0040      RECV_LOOP:	LI	R0,64		;RETRY COUNTER.  THIS WILL DETERMINE HOW LONG TO WAIT FOR USER TO START TRANSFER.
+  0774   C800 084E      	MOV	R0,@RETRY
+                        	;wait for user to start the transfer
+                        
+                        
+                        
+  0778   0201 0008      RECV_HDR:	LI	R1,8
+  077C   2DA0 08B8      	CALL	@RECV_WAIT		;LOOP UNTIL SENDER DONE BEFORE SENDING NAK
+  0780   9802 074D      	CB	R2,@REC_TIME_OUT	;TIMEOUT ERROR ?
+  0784   160F           	JNE	RHNTO		;NO TIMEOUT,
+                        
+  0786   0201 0008      RECV_SECT_ERR:	LI	R1,8
+  078A   2DA0 08B8      	CALL	@RECV_WAIT		;LOOP UNTIL SENDER DONE BEFORE SENDING NAK
+  078E   9802 074D      	CB	R2,@REC_TIME_OUT	;TIMEOUT ERROR ?
+  0792   16F9           	JNE	RECV_SECT_ERR		;NO, THEN STILL STUFF ARRIVING
+  0794   0620 084E      	DEC	@RETRY
+  0798   135E           	JEQ	SECTOR_ERROR 	;FORCE AND END
+  079A   D0A0 0742      	MOVB	@NAK,R2
+  079E   2DA0 08FE      	CALL	@TX
+  07A2   10EA           	JMP	RECV_HDR
+                        ;
+                        ; GOT CHAR MUST BE SOH
+                        ;        
+  07A4   9802 0744      RHNTO:	CB	R2,@SOH
+  07A8   1309           	JEQ	GOT_SOH
+  07AA   9802 0745      	CB	R2,@EOT
+  07AE   1301           	JEQ	GOT_EOT
+                        
+                        ;
+                        ;  WE DIDN'T RECEIVE SOH
+                        ;
+  07B0   10EA           	JMP	RECV_SECT_ERR
+                        
+                        GOT_EOT:
+  07B2   D0A0 0743      	MOVB	@ACK,R2
+  07B6   2DA0 08FE      	CALL	@TX		;SEND ACK RESPONSE
+  07BA   2DC0            	RET
+                        
+                        ;
+                        ; WE HAVE SOH NOW SO BEGIN RECEIVING RECORD OF DATA
+                        ;
+                        GOT_SOH:
+  07BC   0201 0002      	LI	R1,2		;ZERO WAIT TIME
+  07C0   2DA0 08B8      	CALL	@RECV_WAIT		;GET RECORD NUMBER
+  07C4   D802 0749      	MOVB	R2,@RECVD_SECT_NO	;
+  07C8   04C1           	CLR	R1		;ZERO WAIT TIME
+  07CA   2DA0 08B8      	CALL	@RECV_WAIT		;GET INVERTED RECORD NUMBER
+  07CE   D802 074A      	MOVB	R2,@COMP_REC_NO
+                        ;
+                        ; NOW GET 128 BYTES OF DATA
+                        ;
+  07D2   0206 0080      	LI	R6,RECSIZE		;BLOCK SIZE
+  07D6   04C5           	CLR	R5		;CHECKSUM
+                        
+                        NEXT_CHR:
+  07D8   0201 0002      	LI	R1,2		;NOMINAL WAIT TIME
+  07DC   2DA0 08B8       	CALL	@RECV_WAIT
+  07E0   DD02           	MOVB	R2,*R4+			;UPDATE THE RECORD POINTER
+  07E2   B142           	AB	R2,R5			;UPDATE THE CHECKSUM
+  07E4   0606           	DEC	R6			;COUNT DOWN THE NUMBER OF BYTES
+  07E6   16F8           	JNE	NEXT_CHR
+                        ;
+                        ; WAIT FOR CHECKSUM TO BE RECEIVED
+                        ;
+  07E8   0201 0002      	LI	R1,2		;NOMINAL WAIT TIME
+  07EC   2DA0 08B8      	CALL	@RECV_WAIT		;GET CHECKSUM INTO R2
+  07F0   D802 074C      	MOVB	R2,@CHECKSUM
+  07F4   0224 FF80      	AI	R4,-RECSIZE		;ASSUME ERROR SO BACK UP POINTER
+                        
+                        ;
+                        ; CHECK WE HAVE CONSISTENT RECORD NUMBERS AND CHECKSUMS BETWEEN
+                        ; BOTH SENDER AND RECEIVER
+                        ;
+  07F8   D020 0749      	MOVB	@RECVD_SECT_NO,R0
+  07FC   0540           	INV	R0			;INVERT RECORD 1
+  07FE   9800 074A      	CB	R0,@COMP_REC_NO		;INVERTED VALUE OF RECVD SECT NUMBER
+  0802   16C1           	JNE	RECV_SECT_ERR		;BAD RECORD SO TRY AGAIN
+  0804   9142           	CB	R2,R5			;CHECKSUMS MATCH ?
+  0806   16BF           	JNE	RECV_SECT_ERR		;CHECKSUMS DON'T MATCH SO TRY AGAIN
+                        
+                        ;-----------------------------------------------
+                        ;Got a good block. See if we've already received
+                        ;this block. (It might be a retransmission.) If
+                        ;it's the most recently received block, then try
+                        ;again - otherwise it's an error.
+                        ;-----------------------------------------------
+                        ;
+                        ; WE HAVE GOT A SECTOR KEEP IT IF IT IS EQUAL = 1 + PREV SECTOR.
+                        ; IF DUPLICATE KEEP THE LATEST
+                        ;
+  0808   D060 0749      	MOVB	@RECVD_SECT_NO,R1 		;RECEIVED SECTOR NUMBER
+  080C   D020 074B      	MOVB	@SECTNO,R0			;GET PREVIOUS SECTOR NUMBER
+  0810   9001           	CB	R1,R0			;SENDER HAS RESENT THE SAME SECTOR SO PROBABLY MISSED THE ACK, SO RESEND
+  0812   1305           	JEQ	DO_ACK
+                        ;	JL	RCV_SEQ_ERROR		;IF LESS WE MAY BE ABLE TO RECOVER USING ACK
+  0814   0220 0100      	AI	R0,1*256			;CALCULATE WHAT SHOULD BE THE NEXT RECORD NUMBER (ADD ONE)
+  0818   9001           	CB	R1,R0			;IF EQUAL THEN THAT IS WHAT WE EXPECTED
+  081A   1308           	JEQ	GOT_RECORD			;MATCH IF SO GOOD AND IN SEQUENCE
+  081C   1006           	JMP	RCV_SEQ_ERROR		;FATAL ERROR AS WE HAVE LOST A RECORD AND CANNOT RECO	
+                        ;	JMP	DO_ACK			;WE MIGHT BE ABLE TO RECOVER TO CURRENT POSITION BY SENDING ACKS
+                        ;
+                        ;ACKNOWLEDGE A GOOD SECTOR AND LOOK FOR NEXT
+                        ;
+                        DO_ACK:
+  081E   D0A0 0743       	MOVB	@ACK,R2
+  0822   2DA0 08FE      	CALL	@TX
+  0826   0460 0770      	B	@RECV_LOOP
+                        
+                        ;
+                        ; CHECK FOR FILE NUMBERING ERROR 
+                        ;
+                        RCV_SEQ_ERROR:
+  082A   1012           	JMP	SEQUENCE_ERROR					  
+                        ;
+                        GOT_RECORD:
+  082C   D820 0749      	MOVB	@RECVD_SECT_NO,@SECTNO	;UPDATE SECTOR NUMBER
+  0830   074B           
+                        ;
+                        ; WE HAVE A NEW RECORDS HERE SO WRITE THEM TO DISC
+                        ;	
+                        ;
+  0832   0224 0080      	AI	R4,RECSIZE		;BUMP BUFFER POINTER NOW RECORD IS VALID
+  0836   0620 0504      	DEC	@REC_COUNT
+  083A   16F1           	JNE	DO_ACK
+  083C   2DA0 05DC      	CALL	@WRITE_SECTOR	;WE HAVE RECEIVED TWO RECORDS SO WRITE TO DISC
+  0840   0204 0956      	LI	R4,SECTOR_BUFFER	;RESET THE BUFFER POINTER
+  0844   05E0 0504      	INCT	@REC_COUNT		;BUMP THE RECORD COUNT BACK UP TO 4
+  0848   05E0 0504      	INCT	@REC_COUNT
+  084C   10E8           	JMP	DO_ACK
+                        ;
+  084E   0000           RETRY:	WORD	0
+                        ;
+                        ; TRY TO ABORT AND ERROR MESSAGE IS POINTED TO BY R3
+                        ;
+                        
+                        
+                        SEQUENCE_ERROR:
+  0850   0200 069A      	LI	R0,SEQ_ERROR_MSG
+  0854   1006           	JMP	LOAD_END
+                        
+                        SECTOR_ERROR:
+  0856   0200 067A      	LI	R0,SECT_ERROR_MSG
+  085A   1003           	JMP	LOAD_END
+                        
+                        WRITE_ERROR:
+  085C   0200 0640      	LI	R0,WRITE_MESSAGE
+  0860   1000           	JMP	LOAD_END
+                        ;
+                        ;**************************************************************
+                        ;
+                        ;	TRY TO TERMINATE THE TRANSFER.  ALSO DELETE THE FILE
+                        ;
+                        ;***************************************************************
+                        ;
+  0862   C800 0740      LOAD_END:	MOV	R0,@ERR_MSG_ADDR
+                        
+  0866   D0A0 0747      LE_1:	MOVB	@CAN,R2		;CANCEL THE TRANSFER
+  086A   2DA0 08FE      	CALL	@TX
+  086E   0201 0002      	LI	R1,2		;WAIT PERIOD
+  0872   2DA0 08B8      	CALL	@RECV_WAIT
+  0876   9802 074D      	CB	R2,@REC_TIME_OUT	;TIMEOUT ERROR ?
+  087A   16F5           	JNE	LE_1
+                        
+  087C   2DA0 089E      	CALL	@PRINTMSG
+  0880   0201 0080      LE_2	LI	R1,128
+  0884   2DA0 08B8      	CALL	@RECV_WAIT
+  0888   9802 074D      	CB	R2,@REC_TIME_OUT	;TIMEOUT ERROR ?
+  088C   16F9           	JNE	LE_2
+                        
+  088E   0202 0013      	LI	R2,ERAFIL 		;PURGE IF AN ERROR
+  0892   0203 092E      	LI	R3,FCB
+  0896   2DA0 0084      	CALL	@BDOS
+  089A   0460 05D6      	B	@EXIT
+                        
+  089E   C020 0740      PRINTMSG:	MOV	@ERR_MSG_ADDR,R0
+  08A2   D0F0           PM1	MOVB	*R0+,R3
+  08A4   1308           	JEQ	PM2
+  08A6   06C3           	SWPB	R3
+  08A8   0202 0002      	LI	R2,2		;BDOS CONOUT
+  08AC   2E00           	PUSH	R0
+  08AE   2DA0 0084      	CALL	@BDOS
+  08B2   2E40           	POP	R0
+  08B4   10F6           	JMP	PM1
+  08B6   2DC0           PM2	RET
+                        
+                        
+                        ;
+                        ;RX WAIT - CAN TEST FOR TIMEOUT.  TIMEOUT MULTIPLIER IS IN R1
+                        ;
+  08B8   0A81           RECV_WAIT:	SLA	R1,8	        	;TIME OUT FIGURE
+  08BA   2DA0 08C8      SWAIT1:	CALL	@RXSTAT
+  08BE   1615           	JNE	RX		;GO GET CHAR AND RETURN
+  08C0   0601           	DEC	R1
+  08C2   16FB           	JNE	SWAIT1
+  08C4   0702           	SETO	R2		;SHOW  TIMEOUT ERROR
+  08C6   2DC0           	RET
+                        ;
+                        ;	READ CHARACTER STATUS
+                        ;
+  08C8   04C0           RXSTAT:	CLR	R0		;0-> not ready
+  08CA   020C 0080      	LI	R12,80H
+  08CE   1F15           	TB	21		;RECEIVE BUFFER REG FULL ?
+  08D0   1601           	JNE	RX2		;NO
+  08D2   0580           	INC	R0		;YES
+  08D4   C000           RX2:	MOV	R0,R0		;SET FLAGS
+  08D6   2DC0           	RET
+                        
+                        ; Receive a char in R2 no status checking
+                        RX_FLUSH:
+  08D8   04C0           	CLR	R0
+  08DA   020C 0080      	LI	R12,80H
+  08DE   1F15           RX3	TB	21		;RECEIVE BUFFER REG FULL ?  GET RID OF JUNK
+  08E0   13FE           	JEQ	RX3		;NO
+  08E2   3602           	STCR	R2,8
+  08E4   1E12           	SBZ	18		;SHOW WE RECEIVED CHARACTER
+  08E6   C000           	MOV	R0,R0		;SET FLAGS
+  08E8   2DC0           	RET
+                        
+                        ; Receive a char in R2 no status checking
+  08EA   04C2           RX:	CLR	R2
+  08EC   020C 0080      	LI	R12,80H
+  08F0   3602           	STCR	R2,8
+  08F2   1E12           	SBZ	18		;SHOW WE RECEIVED CHARACTER
+  08F4   2DC0           	RET
+                        
+                        ;
+  08F6   0700           WAIT	SETO	R0
+  08F8   0600           WAIT_2	DEC	R0
+  08FA   16FE           	JNE	WAIT_2
+  08FC   2DC0           	RET
+                        ;
+                        ; TX A CHAR
+                        ;
+  08FE   0201 1388      TX	LI	R1,5000
+  0902   020C 0080      	LI	R12,80H
+  0906   2DA0 091A      TX2	CALL	@TXSTAT
+  090A   1603           	JNE	TX3
+  090C   0601           	DEC	R1
+  090E   16FB           	JNE	TX2		
+  0910   2DC0           	RET			;RETURN WITH ZERO IF TIMEOUT
+  0912   1D10           TX3	SBO	16		;TURN ON THE TRANSMITTER
+  0914   3202           	LDCR	R2,8
+  0916   1E10           	SBZ	16		;TURN OFF TRANSMITTER
+  0918   2DC0           	RET
+                        
+                        ; TX STATUS
+                        ;
+  091A   04C0           TXSTAT	CLR	R0		;0-> not ready
+  091C   020C 0080      	LI	R12,80H
+  0920   1D10           	SBO	16		;TURN ON THE TRANSMITTER
+                        TX_STAT1
+  0922   1F16           	TB	22		;WAIT FOR XBRE =1
+  0924   16FE           	JNE	TX_STAT1
+  0926   1E10           	SBZ	16		;TURN OFF TRANSMITTER
+  0928   0580           	INC	R0	
+  092A   C000           	MOV	R0,R0		;set flags
+  092C   2DC0           	RET
+                        ;
+                        ;	BUFFER AND STACK AREA ETC, BLOCK STARTED FOR SYMBOL
+                        ;
+  092E                  FCB:		BSS	36
+  0952   0000           LINPTR:		WORD	0
+  0954   0956           BUFFER_POINTER:	WORD	SECTOR_BUFFER
+                        
+  0956                  SECTOR_BUFFER:	BSS	BYTSEC
+  0B56   1234           		WORD	1234H
+  0B58                  		END
+
+No error(s).
+PM1              08A2  SECTOR_ERROR     0856  NEXT_CHR         07D8  REC_COUNT        0504  
+LE_1             0866  ERR_MSG_ADDR     0740  SETDMA           001A  PRINTMSG         089E  
+NULL             0748  TX               08FE  MKERR            05A6  RXSTAT           08C8  
+PM2              08B6  CLOSE_MESSAGE    0708  BYTSEC           0200  RX3              08DE  
+R0               0000  RECV_HDR         0778  R2               0002  SECT_ERROR_MSG   067A  
+R4               0004  RECV_FILE        074E  SEQUENCE_ERROR   0850  LARGE_FILE_MSG   0724  
+R7               0007  R14              000E  R8               0008  CHECKSUM         074C  
+WRITE_MESSAGE    0640  RECV_LOOP        0770  END_MESSAGE      06C2  FTY              000B  
+NAMSIZ           000B  START            050A  RCV_SEQ_ERROR    082A  BUFFER_POINTER   0954  
+RX               08EA  SWITCH           0503  SUCCESS          06FC  TX2              0906  
+WRITE_SECTOR     05DC  GOT_RECORD       082C  VERSION          06CE  SWAIT1           08BA  
+FCLOSE           0010  CLOSE_FILE       05BE  R12              000C  SECTOR_BUFFER    0956  
+RECVD_SECT_NO    0749  WRITE_ERROR      085C  SP               000A  TX_STAT1         0922  
+WAIT_2           08F8  R15              000F  RX2              08D4  CLS_1            05C8  
+RX_FLUSH         08D8  ERAFIL           0013  TPA              0500  START01          0516  
+RET              2DC0  EXIT             05D6  SAVING           06EC  LOAD_END         0862  
+RHNTO            07A4  POP              2E40  REC_TIME_OUT     074D  FLA              0010  
+NAM              0000  TXSTAT           091A  SOH              0744  FSZ              000E  
+NAM4             0552  RHEX             2EC0  R3               0003  ETB              0746  
+PUSH             2E00  CALL             2D80  RECV_SECT_ERR    0786  TX3              0912  
+SECTNO           074B  CRLF             0600  GOT_SOH          07BC  MESG             2F80  
+MDMMSG           0660  SPACE            0502  GOT_NAME         055A  WAIT             08F6  
+SL               0009  START02          0526  RETRY            084E  MAKFIL           0016  
+RECV_WAIT        08B8  FCB              092E  DO_ACK           081E  WAIT1            075C  
+R13              000D  SELDSK           000E  LE_2             0880  SEQ_ERROR_MSG    069A  
+NAM0             0544  FSB              000C  R5               0005  NAK              0742  
+R11              000B  WRSEQ            0015  CMDLINE          00A0  CMDERR           05AE  
+ACK              0743  EOT              0745  OPEN             000F  CAN              0747  
+CMD_ERROR        0506  RECSIZE          0080  SHELL            0080  CRN              001A  
+R6               0006  WAIT2            0760  WRITE            2F00  COMP_REC_NO      074A  
+LINPTR           0952  GOT_EOT          07B2  WHEX             2E80  WS_E             05FC  
+READ             2F40  CMDMSG           0604  BDOS             0084  MAKMSG           0626  
+R1               0001  
+
